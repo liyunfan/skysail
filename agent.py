@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -187,11 +188,16 @@ class ModelResponse:
 
     is_final:
       True when the model says the task is complete.
+
+    raw:
+      Original provider message content before parsing.
+      Useful for debugging and trace replay.
     """
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     is_final: bool = False
+    raw: str = ""
 
 
 class Model(Protocol):
@@ -208,6 +214,14 @@ class Model(Protocol):
     ) -> ModelResponse:
         ...
 
+# =============================================================================
+# Errors
+# =============================================================================
+
+class ModelParseError(ValueError):
+    def __init__(self, message: str, raw: str) -> None:
+        super().__init__(message)
+        self.raw = raw
 
 # =============================================================================
 # Config
@@ -225,6 +239,9 @@ MAX_OUTPUT_CHARS = int(os.getenv("MAX_OUTPUT_CHARS", "20000"))
 
 CONTROL_PREFIX = "§AGENT "
 
+VERBOSE = os.getenv("VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
+TRACE_DIR = Path(os.getenv("TRACE_DIR", ".skysail/runs"))
+TRACE_FILE = os.getenv("TRACE_FILE", "")
 
 # =============================================================================
 # Utilities
@@ -259,6 +276,35 @@ def one_line(text: str, limit: int = 160) -> str:
         return first[:limit] + "..."
     return first
 
+class TraceLogger:
+    def __init__(self, enabled: bool, trace_file: str = "") -> None:
+        self.enabled = enabled
+        self.path: Path | None = None
+
+        if not enabled and not trace_file:
+            return
+
+        if trace_file:
+            self.path = Path(trace_file)
+        else:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            self.path = TRACE_DIR / f"{timestamp}.jsonl"
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[trace] writing {self.path}", file=sys.stderr)
+
+    def event(self, event_type: str, **data: Any) -> None:
+        if self.path is None:
+            return
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "type": event_type,
+            **data,
+        }
+
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 # =============================================================================
 # Tools
@@ -308,7 +354,7 @@ def tool_ls(path: str = ".", max_depth: int = 2) -> str:
     return "\n".join(lines) or "(empty)"
 
 
-def tool_read(path: str) -> str:
+def tool_read(path: str, offset: int = 0, limit: int = MAX_OUTPUT_CHARS) -> str:
     target = safe_path(path)
 
     if not target.exists():
@@ -317,7 +363,18 @@ def tool_read(path: str) -> str:
     if not target.is_file():
         return f"Not a file: {path}"
 
-    return truncate(target.read_text(errors="replace"))
+    text = target.read_text(errors="replace")
+    offset = max(0, int(offset))
+    limit = max(1, int(limit))
+
+    chunk = text[offset:offset + limit]
+    end = offset + len(chunk)
+
+    suffix = ""
+    if end < len(text):
+        suffix = f"\n\n[truncated: showing chars {offset}-{end} of {len(text)}]"
+
+    return chunk + suffix
 
 
 def tool_write(path: str, content: str) -> str:
@@ -378,9 +435,11 @@ def build_tools() -> dict[str, Tool]:
         Tool(
             spec=ToolSpec(
                 name="read",
-                description="Read a UTF-8 text file from the workspace.",
+                description="Read a UTF-8 text file from the workspace. Supports optional character offset and limit.",
                 params=[
                     ParamSpec("path", "string", "Workspace-relative file path to read."),
+                    ParamSpec("offset", "integer", "Character offset to start reading from.", required=False, default=0),
+                    ParamSpec("limit", "integer", "Maximum characters to return.", required=False, default=MAX_OUTPUT_CHARS),
                 ],
             ),
             run=tool_read,
@@ -455,7 +514,10 @@ class TextFrameModel:
         tools: list[ToolSpec],
     ) -> ModelResponse:
         raw = self._chat(messages, tools)
-        return self._parse(raw)
+        try:
+            return self._parse(raw)
+        except Exception as e:
+            raise ModelParseError(str(e), raw) from e
 
     def _chat(
         self,
@@ -605,7 +667,7 @@ Available tools:
             raise ValueError("control frame cannot contain both final and tool_calls")
 
         if has_final:
-            return ModelResponse(text=visible, is_final=True)
+            return ModelResponse(text=visible, is_final=True, raw=raw)
 
         if has_tool_calls:
             raw_calls = frame["tool_calls"]
@@ -646,7 +708,7 @@ Available tools:
                     )
                 )
 
-            return ModelResponse(text=visible, tool_calls=calls, is_final=False)
+            return ModelResponse(text=visible, tool_calls=calls, is_final=False, raw=raw)
 
         raise ValueError("control frame must contain either final=true or tool_calls")
 
@@ -661,10 +723,12 @@ class Agent:
         model: Model,
         tools: dict[str, Tool],
         max_steps: int,
+        logger: TraceLogger,
     ) -> None:
         self.model = model
         self.tools = tools
         self.max_steps = max_steps
+        self.logger = logger
 
     def run(self, task: str) -> str:
         messages = [
@@ -674,14 +738,59 @@ class Agent:
             )
         ]
 
+        self.logger.event(
+            "run_start",
+            task=task,
+            workdir=str(WORKDIR),
+            model=getattr(self.model, "model", ""),
+            max_steps=self.max_steps,
+            tools=list(self.tools.keys()),
+        )
+
         tool_specs = [tool.spec for tool in self.tools.values()]
 
         for step in range(1, self.max_steps + 1):
+            self.logger.event("step_start", step=step)
             print(f"\n--- step {step}/{self.max_steps} ---", file=sys.stderr)
 
             try:
                 response = self.model.respond(messages, tool_specs)
+                self.logger.event(
+                    "model_raw",
+                    step=step,
+                    raw=response.raw,
+                )
+                self.logger.event(
+                    "model_parsed",
+                    step=step,
+                    text=response.text,
+                    is_final=response.is_final,
+                    tool_calls=[
+                        {
+                            "id": call.id,
+                            "index": call.index,
+                            "name": call.name,
+                            "input": call.input,
+                        }
+                        for call in response.tool_calls
+                    ],
+                )
+
             except Exception as e:
+                raw = getattr(e, "raw", "")
+                if raw:
+                    self.logger.event(
+                        "model_raw",
+                        step=step,
+                        raw=raw,
+                    )
+
+                self.logger.event(
+                    "runtime_error",
+                    step=step,
+                    error=str(e),
+                )
+                
                 error_message = (
                     "The previous model response could not be parsed or executed by the runtime.\n"
                     f"Runtime error: {e}\n\n"
@@ -698,11 +807,16 @@ class Agent:
             messages.append(
                 ChatMessage(
                     role="assistant",
-                    content=response.text or "(assistant requested tool calls)",
+                    content=response.raw or response.text or "(assistant requested tool calls)",
                 )
             )
 
             if response.is_final:
+                self.logger.event(
+                    "run_final",
+                    step=step,
+                    output=response.text or "Done.",
+                )
                 return response.text or "Done."
 
             if not response.tool_calls:
@@ -717,8 +831,29 @@ class Agent:
                 )
                 continue
 
+            for call in response.tool_calls:
+                self.logger.event(
+                    "tool_call",
+                    step=step,
+                    id=call.id,
+                    index=call.index,
+                    name=call.name,
+                    input=call.input,
+            )
+                
             results = [self._execute_tool_call(call) for call in response.tool_calls]
 
+            for result in results:
+                self.logger.event(
+                    "tool_result",
+                    step=step,
+                    id=result.id,
+                    index=result.index,
+                    name=result.name,
+                    ok=result.ok,
+                    output=result.output,
+            )
+                
             for result in results:
                 status = "ok" if result.ok else "error"
                 print(
@@ -807,11 +942,17 @@ def main() -> None:
         api_key=API_KEY,
         base_url=BASE_URL,
     )
+    
+    logger = TraceLogger(
+        enabled=VERBOSE,
+        trace_file=TRACE_FILE,
+    )
 
     agent = Agent(
         model=model,
         tools=tools,
         max_steps=MAX_STEPS,
+        logger=logger,
     )
 
     try:

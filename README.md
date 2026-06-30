@@ -63,16 +63,18 @@ Current version:
 * workspace path safety
 * shell command guardrails
 * basic output truncation
+* verbose JSONL trace logging
+* raw model message preservation in conversation history
 * no framework dependency
 
 Initial tools:
 
-| Tool    | Purpose                     |
-| ------- | --------------------------- |
-| `ls`    | List files in the workspace |
-| `read`  | Read a text file            |
-| `write` | Write a full file           |
-| `sh`    | Run a shell command         |
+| Tool    | Purpose                                              |
+| ------- | ---------------------------------------------------- |
+| `ls`    | List files in the workspace                          |
+| `read`  | Read a text file, with optional `offset` and `limit` |
+| `write` | Write a full file                                    |
+| `sh`    | Run a shell command                                  |
 
 Advanced editing tools such as patching, diff review, search, session replay, and context compaction are intentionally left for later versions.
 
@@ -109,12 +111,31 @@ export MAX_TOOL_CALLS=5
 export MAX_OUTPUT_CHARS=20000
 ```
 
+Verbose trace logging:
+
+```bash
+export VERBOSE=1
+export TRACE_DIR=".skysail/runs"
+```
+
+You can also write a single trace file explicitly:
+
+```bash
+export TRACE_FILE=".skysail/runs/debug.jsonl"
+```
+
 ## Usage
 
 Run a basic inspection task:
 
 ```bash
 python agent.py "inspect this repository and explain how it works"
+```
+
+Run with verbose trace logging:
+
+```bash
+VERBOSE=1 python agent.py "inspect this repository and explain how it works"
 ```
 
 Run a self-bootstrapping task:
@@ -128,6 +149,41 @@ Ask it to make a small repository change:
 ```bash
 python agent.py "add a short project summary to README.md"
 ```
+
+If you use a `.env` file:
+
+```bash
+set -a; source .env; set +a; python agent.py "inspect this repo"
+```
+
+With verbose logs:
+
+```bash
+set -a; source .env; set +a; VERBOSE=1 python agent.py "inspect this repo"
+```
+
+## Trace Logs
+
+When `VERBOSE=1` is enabled, SkySail writes JSONL trace logs under `.skysail/runs/` by default.
+
+A trace records runtime events such as:
+
+* `run_start`
+* `step_start`
+* `model_raw`
+* `model_parsed`
+* `tool_call`
+* `tool_result`
+* `runtime_error`
+* `run_final`
+
+Example:
+
+```json
+{"type":"model_raw","step":1,"raw":"Let me inspect the repository.\n\n§AGENT {\"tool_calls\":[{\"name\":\"ls\",\"input\":{\"path\":\".\",\"max_depth\":2}}]}"}
+```
+
+This is useful for debugging model protocol issues, parser errors, tool call mistakes, and self-bootstrapping behavior.
 
 ## Design
 
@@ -203,6 +259,26 @@ This design keeps natural language separate from machine-readable tool calls wit
 
 The parser only reads the final non-empty line. It does not scan the full message body for tags.
 
+SkySail also preserves the raw model message in conversation history. This helps the model see its previous control frames and makes the text-frame protocol more stable across steps.
+
+## Tool Notes
+
+### `read`
+
+The `read` tool supports optional character-based pagination:
+
+```json
+{"path":"agent.py","offset":0,"limit":20000}
+```
+
+This allows the model to inspect large files without relying on full-file reads.
+
+### `sh`
+
+The `sh` tool runs shell commands in the workspace and includes a small blocklist for obviously destructive commands.
+
+It is a guardrail, not a sandbox.
+
 ## Philosophy
 
 SkySail is based on a few constraints:
@@ -231,6 +307,22 @@ A model response should be able to contain useful visible communication and stru
 
 SkySail should be able to inspect and improve its own source code, with verification after changes.
 
+## Changelog
+
+### Unreleased
+
+#### Added
+
+* Added verbose JSONL trace logging with `VERBOSE`, `TRACE_DIR`, and `TRACE_FILE`.
+* Added trace events for model raw output, parsed responses, tool calls, tool results, runtime errors, and final output.
+* Added raw model message preservation in conversation history to make the text-frame protocol more stable.
+* Added optional `offset` and `limit` support to the `read` tool for inspecting large files.
+
+#### Changed
+
+* Updated runtime history handling to store the raw assistant message instead of only visible text.
+* Updated documentation to include trace logging and paginated file reads.
+
 ## Roadmap
 
 ### v0.1
@@ -240,13 +332,16 @@ SkySail should be able to inspect and improve its own source code, with verifica
 * model interface
 * text-frame model adapter
 * basic agent loop
+* verbose trace logging
+* raw message history
+* `read` offset/limit support
 
 ### v0.2
 
-* session trace
-* better runtime logging
 * safer write flow
 * basic self-test command
+* better parse-error recovery
+* cleaner handling of ignored and secret files
 
 ### v0.3
 
@@ -285,6 +380,15 @@ git commit -m "checkpoint before SkySail run"
 ```
 
 Then run SkySail.
+
+Do not commit secrets. A typical `.gitignore` should include:
+
+```gitignore
+.env
+.env.*
+!.env.example
+.skysail/runs/
+```
 
 ## License
 

@@ -2,7 +2,7 @@
 
 A self-bootstrapping agent runtime in one readable Python file.
 
-SkySail starts as a small `agent.py`: it can inspect files, write files, run shell commands, communicate with a model, and gradually improve itself.
+SkySail starts as a small `agent.py`: it can inspect files, write files, run shell commands, communicate with a model, ask the user for direction, and gradually improve itself.
 
 The goal is not to build another large agent framework.
 The goal is to make the core mechanics of a tool-using agent visible, portable, and easy to modify.
@@ -25,6 +25,8 @@ SkySail takes the opposite path:
 * small internal protocol
 * provider-neutral runtime design
 * simple tool system
+* multi-turn session loop
+* human-in-the-loop collaboration
 * easy to copy, inspect, and change
 
 SkySail is designed to be a small agent kernel that can grow through self-bootstrapping.
@@ -33,23 +35,23 @@ SkySail is designed to be a small agent kernel that can grow through self-bootst
 
 SkySail is early.
 
-The first version focuses on the minimum useful agent loop:
+The current version focuses on a minimal but useful multi-turn agent runtime:
 
 ```text
-user task
+user input
+   ↓
+agent session
    ↓
 model response
    ↓
-visible text + tool calls
+tool calls or normal assistant reply
    ↓
-tool execution
+execute tools or yield to user
    ↓
-tool results
-   ↓
-next model response
-   ↓
-repeat until final
+repeat
 ```
+
+The agent can now inspect code, call tools, ask structured questions, yield to the user, receive another user message, and continue with the same conversation history.
 
 ## Features
 
@@ -58,8 +60,12 @@ Current version:
 * single-file `agent.py`
 * minimal tool set
 * model interface abstraction
-* text-frame tool-call protocol
+* text-frame fallback model adapter
 * ordered tool calls
+* multi-turn session loop
+* `Agent` owns conversation history
+* structured `question` tool for human-in-the-loop choices
+* normal assistant replies yield control back to the user
 * workspace path safety
 * shell command guardrails
 * basic output truncation
@@ -69,14 +75,15 @@ Current version:
 
 Initial tools:
 
-| Tool    | Purpose                                              |
-| ------- | ---------------------------------------------------- |
-| `ls`    | List files in the workspace                          |
-| `read`  | Read a text file, with optional `offset` and `limit` |
-| `write` | Write a full file                                    |
-| `sh`    | Run a shell command                                  |
+| Tool       | Purpose                                              |
+| ---------- | ---------------------------------------------------- |
+| `ls`       | List files in the workspace                          |
+| `read`     | Read a text file, with optional `offset` and `limit` |
+| `question` | Ask the user a structured question                   |
+| `write`    | Write a full file                                    |
+| `sh`       | Run a shell command                                  |
 
-Advanced editing tools such as patching, diff review, search, session replay, and context compaction are intentionally left for later versions.
+Advanced editing tools such as patching, diff review, session replay, context compaction, native tool-calling adapters, and permission policy are intentionally left for later versions.
 
 ## Installation
 
@@ -93,7 +100,7 @@ Python 3.10+ is recommended.
 
 ## Configuration
 
-SkySail expects a chat-completions-compatible endpoint.
+SkySail currently expects a chat-completions-compatible endpoint.
 
 Set the following environment variables:
 
@@ -144,10 +151,32 @@ Run a self-bootstrapping task:
 python agent.py "read agent.py and suggest one small improvement. If it is safe, implement it and run a syntax check."
 ```
 
-Ask it to make a small repository change:
+Ask it to discuss a larger change before acting:
 
 ```bash
-python agent.py "add a short project summary to README.md"
+python agent.py "help me redesign this agent, but confirm the plan with me first"
+```
+
+SkySail now keeps a multi-turn CLI session.
+
+After the assistant yields control, continue typing:
+
+```text
+> I prefer the smaller version. Keep it single-file.
+```
+
+Exit with:
+
+```text
+Ctrl+C
+```
+
+or:
+
+```text
+exit
+quit
+:q
 ```
 
 If you use a `.env` file:
@@ -174,8 +203,9 @@ A trace records runtime events such as:
 * `model_parsed`
 * `tool_call`
 * `tool_result`
+* `user_input`
+* `run_yield`
 * `runtime_error`
-* `run_final`
 
 Example:
 
@@ -183,7 +213,7 @@ Example:
 {"type":"model_raw","step":1,"raw":"Let me inspect the repository.\n\n§AGENT {\"tool_calls\":[{\"name\":\"ls\",\"input\":{\"path\":\".\",\"max_depth\":2}}]}"}
 ```
 
-This is useful for debugging model protocol issues, parser errors, tool call mistakes, and self-bootstrapping behavior.
+This is useful for debugging model protocol issues, parser errors, tool call mistakes, conversation pauses, and self-bootstrapping behavior.
 
 ## Design
 
@@ -192,6 +222,7 @@ SkySail is organized as logical sections inside one file:
 ```text
 agent.py
 ├── Types
+├── Errors
 ├── Config
 ├── Utilities
 ├── Tools
@@ -218,28 +249,85 @@ The core types are:
 The agent runtime only depends on this normalized protocol:
 
 ```text
-messages + tools
+Agent session messages
      ↓
 model.respond(...)
      ↓
-ModelResponse(text, tool_calls, is_final)
+ModelResponse(text, tool_calls, raw)
      ↓
-execute ToolCall(s)
+if tool_calls: execute tools and continue
      ↓
-append ToolResult(s)
-     ↓
-repeat
+if no tool_calls: yield to user
 ```
 
 Provider-specific details should stay inside model adapters.
 
-## Text-frame Protocol
+## Agent Session Model
 
-The first model adapter does not rely on native tool calling.
+SkySail now treats `Agent` as a session object.
 
-Instead, the model writes normal visible text, then appends one machine-readable control frame as the final non-empty line.
+The `Agent` owns the conversation history.
 
-Example tool call:
+Conceptually:
+
+```text
+Agent.start(task)
+  add first user message
+  run until the model stops asking for tools
+
+Agent.send(user_input)
+  add next user message
+  run until the model stops asking for tools
+
+Agent.run_until_yield()
+  execute the automatic tool loop
+  yield when there are no more tool calls
+```
+
+The CLI does not own the message history.
+
+The CLI only reads user input, sends it to the agent, prints the assistant response, and repeats.
+
+This design prepares the runtime for future session persistence and resume.
+
+## Runtime Rule
+
+SkySail’s runtime rule is deliberately small:
+
+```text
+tool calls present  → execute tools and continue
+tool calls absent   → yield control to the user
+```
+
+There is no separate `final` protocol state.
+
+There is no separate `await_user` protocol state.
+
+A normal assistant reply may mean:
+
+```text
+The task is complete.
+```
+
+or:
+
+```text
+I need your decision before continuing.
+```
+
+The runtime does not need to distinguish those meanings.
+
+The user can always continue the conversation.
+
+## Text-frame Adapter
+
+The current model adapter is `TextFrameModel`.
+
+It does not rely on native tool calling.
+
+Instead, the model writes normal visible text, then appends one machine-readable tool-call frame as the final non-empty line.
+
+Example:
 
 ```text
 I will inspect the repository first.
@@ -247,19 +335,63 @@ I will inspect the repository first.
 §AGENT {"tool_calls":[{"name":"ls","input":{"path":".","max_depth":2}}]}
 ```
 
-Example final response:
+If the model does not need tools, it simply replies in normal natural language without a control frame:
 
 ```text
-The repository contains a single-file agent runtime with a minimal tool system and a provider-neutral model interface.
+I found three possible directions:
 
-§AGENT {"final":true}
+1. Add session resume
+2. Improve CLI display
+3. Add safer editing
+
+I recommend starting with session resume because longer tasks are already hitting step limits.
+
+Which direction do you want me to take?
 ```
 
-This design keeps natural language separate from machine-readable tool calls without forcing the entire assistant response into JSON.
+A normal reply means:
 
-The parser only reads the final non-empty line. It does not scan the full message body for tags.
+```text
+no tool calls
+→ yield control to the user
+```
 
-SkySail also preserves the raw model message in conversation history. This helps the model see its previous control frames and makes the text-frame protocol more stable across steps.
+The parser only reads the final non-empty line when a tool-call control frame is present. It does not scan the full message body for tags.
+
+SkySail also preserves the raw model message in conversation history. This helps the model see its previous control frames and makes the text-frame fallback more stable across steps.
+
+## Native Tool Calling Direction
+
+The text-frame adapter is useful for bootstrapping, but it should not be the long-term default.
+
+Most modern model APIs support native tool use.
+
+A future version should add an OpenAI-style native tool-calling adapter and make it the default model path.
+
+The intended direction:
+
+```text
+OpenAI-style native tool calling
+  default adapter
+
+TextFrameModel
+  temporary fallback or removed later
+
+Anthropic tool-use adapter
+  added later if needed
+```
+
+The internal runtime should remain the same.
+
+Only the model adapter should change.
+
+The adapter’s job is to normalize provider-specific output into:
+
+```text
+ModelResponse(text, tool_calls, raw)
+```
+
+This keeps the core runtime provider-neutral while avoiding fragile text parsing when native tool calls are available.
 
 ## Tool Notes
 
@@ -273,15 +405,56 @@ The `read` tool supports optional character-based pagination:
 
 This allows the model to inspect large files without relying on full-file reads.
 
+### `question`
+
+The `question` tool lets the model ask the user a short structured question.
+
+Example:
+
+```json
+{
+  "title": "Choose scope",
+  "question": "How large should this change be?",
+  "options": ["minimal", "moderate", "large"],
+  "allow_free_text": true
+}
+```
+
+The `question` tool is useful for explicit choices.
+
+For longer design proposals or open-ended discussion, the model should use a normal assistant reply without tool calls.
+
 ### `sh`
 
 The `sh` tool runs shell commands in the workspace and includes a small blocklist for obviously destructive commands.
 
 It is a guardrail, not a sandbox.
 
+## Known Limitations
+
+SkySail currently keeps session state in memory.
+
+If the process exits, the session is lost.
+
+For larger tasks, the agent may stop before completing all work if it reaches `MAX_STEPS`.
+
+You can raise the step limit:
+
+```bash
+MAX_STEPS=30 python agent.py "continue the previous task"
+```
+
+But this is only a temporary workaround.
+
+A future version should support session persistence and resume so that long-running work can be paused, inspected, and continued safely.
+
+The CLI output is also still rough. It is useful for debugging, but tool calls and long-running steps need a clearer display.
+
+Long sessions may also become slower because every model call receives the growing conversation history. Future versions should consider provider cache support, context compaction, and better long-session memory management.
+
 ## Philosophy
 
-SkySail is based on a few constraints:
+SkySail is based on a few constraints.
 
 ### 1. Single-file first
 
@@ -299,11 +472,23 @@ SkySail should expose the essential agent loop before adding framework-level abs
 
 The runtime should not be tied to one model provider's tool-calling format.
 
-### 5. Natural language plus tool calls
+### 5. Tool calls, not protocol states
 
-A model response should be able to contain useful visible communication and structured tool calls.
+The runtime should stay centered on one question:
 
-### 6. Self-bootstrapping
+```text
+Did the model request tools?
+```
+
+If yes, execute tools.
+
+If no, yield control to the user.
+
+### 6. Human-in-the-loop collaboration
+
+The agent should be able to ask questions, propose plans, wait for feedback, and continue based on the user's answer.
+
+### 7. Self-bootstrapping
 
 SkySail should be able to inspect and improve its own source code, with verification after changes.
 
@@ -314,14 +499,22 @@ SkySail should be able to inspect and improve its own source code, with verifica
 #### Added
 
 * Added verbose JSONL trace logging with `VERBOSE`, `TRACE_DIR`, and `TRACE_FILE`.
-* Added trace events for model raw output, parsed responses, tool calls, tool results, runtime errors, and final output.
-* Added raw model message preservation in conversation history to make the text-frame protocol more stable.
+* Added trace events for model raw output, parsed responses, tool calls, tool results, runtime errors, user input, and yield points.
+* Added raw model message preservation in conversation history.
 * Added optional `offset` and `limit` support to the `read` tool for inspecting large files.
+* Added `question` tool for short structured human-in-the-loop choices.
+* Added multi-turn CLI session loop.
+* Added `Agent.start(...)`, `Agent.send(...)`, and `Agent.run_until_yield(...)`.
+* Moved conversation history ownership into `Agent`.
 
 #### Changed
 
-* Updated runtime history handling to store the raw assistant message instead of only visible text.
-* Updated documentation to include trace logging and paginated file reads.
+* Simplified runtime semantics around tool calls.
+* Removed `final` as a first-class protocol state.
+* Removed `await_user` as a first-class protocol state.
+* Treat model responses without tool calls as normal assistant replies that yield control to the user.
+* Updated the system prompt to describe only tool-call control frames and normal replies.
+* Updated documentation to include the session model, multi-turn behavior, long-session concerns, and native tool-calling direction.
 
 ## Roadmap
 
@@ -336,32 +529,60 @@ SkySail should be able to inspect and improve its own source code, with verifica
 * raw message history
 * `read` offset/limit support
 
-### v0.2
+### Day 1 / v1
 
-* safer write flow
-* basic self-test command
-* better parse-error recovery
-* cleaner handling of ignored and secret files
+* structured `question` tool
+* conversation through normal assistant replies
+* multi-turn session loop
+* `Agent` owns message history
+* simplified runtime semantics around tool calls
+* no `final` / `await_user` protocol states
+* normal replies yield control back to the user
 
-### v0.3
+### v1.1
 
-* patch/edit tool
-* git diff review
-* improved shell permissions
-* resume previous run
+* better CLI display
+* visible progress / process peek
+* improved tool call formatting
+* compact and verbose output modes
+* clearer step-limit summaries
 
-### v0.4
+### v1.2
 
-* native tool-calling adapters
-* provider-specific message conversion
-* better tool schema generation
+* session persistence
+* resume previous session
+* trace-to-session linkage
+* unfinished work summary
+* fault recovery for long-running tasks
 
-### v0.5
+### v1.3
+
+* OpenAI-style native tool-calling adapter as the default path
+* convert `ToolSpec` to provider-native tool schema
+* normalize provider-native tool calls into `ToolCall`
+* reduce reliance on text-frame parsing
+
+### v1.4
 
 * context compaction
+* provider cache support
+* long-session performance improvements
+* repeated-read avoidance
+
+### v1.5
+
+* safer write flow
+* patch/edit tool
+* git diff review
+* basic self-test command
+
+### Later
+
+* Anthropic tool-use adapter
 * trace replay
 * small evaluation runner
 * permission policy
+* MCP-style tool integration
 
 ## Safety Notes
 
